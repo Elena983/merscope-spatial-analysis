@@ -1,0 +1,82 @@
+library(R.utils)
+library(stringr)
+library(arrow)
+library(DropletUtils)
+library(BiocParallel)
+library(DelayedArray)
+library(rhdf5)
+# The cell boundaries are in hdf5 files
+# Each one is for an FOV, and there are 7 z-planes.
+# However, from the few I checked, all the 7 are the same
+# So I wonder why they even bothered to save 7 copies. I'll just use the first one.
+# I think I'll save each z-plane as a separate sf data frame, and keep the sf
+# data frames separate from the main SFE object, which has the centroids.
+# I'm not going through df2sf here.
+
+h52poly_fov <- function(fn, i) {
+  l <- rhdf5::h5dump(fn)[[1]]
+  cell_ids <- names(l)
+  geometries <- lapply(l, function(m) sf::st_polygon(list(t(m[["zIndex_0"]]$p_0$coordinates[,,1]))))
+  df <- data.frame(geometry = sf::st_sfc(geometries),
+                   ID = cell_ids,
+                   fov = i)
+  sf::st_sf(df)
+}
+
+fns <- list.files("cell_boundaries", "*.hdf5", full.names = TRUE)
+polys <- bpmapply(h52poly_fov, fn = fns, i = seq_along(fns), SIMPLIFY = FALSE, 
+                  BPPARAM = SnowParam(20, progressbar = TRUE))
+polys <- do.call(bind_rows, polys)
+
+mat <- vroom("Liver1Slice1_cell_by_gene.csv")
+polys <- polys[match(mat$cell, polys$ID),]
+metadata <- vroom("Liver1Slice1_cell_metadata.csv")
+metadata <- metadata[match(mat$cell, metadata$cell),]
+
+m <- as.matrix(mat[,-1])
+m <- as(m, "dgCMatrix")
+rownames(m) <- mat$cell
+m <- t(m)
+
+polys$fov <- NULL
+# Takes a while to make the POINT geometry for the centroids, not too bad
+sfe <- SpatialFeatureExperiment(assays = list(counts = m),
+                                colData = metadata[,-1], 
+                                spatialCoordsNames = c("center_x", "center_y"))
+
+rownames(polys) <- polys$ID
+polys$ID <- NULL
+cellSeg(sfe) <- polys
+
+#quality control
+addQC <- function(sfe, species = "human") {
+  mat <- counts(sfe)
+  colData(sfe)$nCounts <- colSums(mat)
+  colData(sfe)$nGenes <- colSums(mat > 0)
+  mt_regex <- if (species == "human") "^MT-" else "^Mt-"
+  if (any(str_detect(rownames(mat), mt_regex))) {
+    mito_genes <- str_detect(rownames(mat), "^MT-")
+    colData(sfe)$prop_mito <- colSums(mat[mito_genes,])/colData(sfe)$nCounts
+  }
+  rowData(sfe)$means <- rowMeans(mat)
+  rowData(sfe)$vars <- rowVars(mat)
+  rowData(sfe)$cv2 <- rowData(sfe)$vars/rowData(sfe)$means^2
+  sfe
+}addQC <- function(sfe, species = "human") {
+  mat <- counts(sfe)
+  colData(sfe)$nCounts <- colSums(mat)
+  colData(sfe)$nGenes <- colSums(mat > 0)
+  mt_regex <- if (species == "human") "^MT-" else "^Mt-"
+  if (any(str_detect(rownames(mat), mt_regex))) {
+    mito_genes <- str_detect(rownames(mat), "^MT-")
+    colData(sfe)$prop_mito <- colSums(mat[mito_genes,])/colData(sfe)$nCounts
+  }
+  rowData(sfe)$means <- rowMeans(mat)
+  rowData(sfe)$vars <- rowVars(mat)
+  rowData(sfe)$cv2 <- rowData(sfe)$vars/rowData(sfe)$means^2
+  sfe
+}
+
+cellSeg(sfe) <- polys
+sfe <- addQC(sfe)
+saveRDS(sfe, "merfish_liver2.rds")
