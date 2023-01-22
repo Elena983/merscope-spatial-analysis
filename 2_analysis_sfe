@@ -1,0 +1,594 @@
+#MERSCOPE human liver dataset
+#Considerations of large data
+
+library(SpatialFeatureExperiment)
+library(vroom)
+library(SingleCellExperiment)
+library(sf)
+library(terra)
+library(EBImage)
+library(rmapshaper)
+library(lwgeom)
+library(tidyverse)
+library(jsonlite)
+library(Matrix)
+library(Voyager)
+library(R.utils)
+library(stringr)
+library(arrow)
+library(DropletUtils)
+library(BiocParallel)
+library(DelayedArray)
+library(rhdf5)
+library(scuttle)
+library(scater)
+library(BiocNeighbors)
+library(SpatialExperiment)
+library(sp)
+library(patchwork)
+library(spdep)
+library(gstat)
+library(automap)
+library(BiocSingular)
+
+# to plot bazillions of points without much waiting
+library(scattermore)
+
+#A completely empty theme automatically applied to every plot
+theme_set(theme_void())
+
+setwd("D:/ETH/Merscope/liver_cancer_merscope")
+
+sfe <- readRDS('merfish_liver1.rds')
+
+#568355 cells in this dataset
+str(sfe)
+
+# Plotting cells all as polygons (takes a while)
+#but cell density can be vaguely seen in the plot
+ggplot(colGeometry(sfe, "cellSeg")) + 
+  geom_sf(size = 0.1) +
+  scale_x_continuous(expand = expansion()) +
+  scale_y_continuous(expand = expansion()) +
+  theme_bw()
+
+#count the number of cells in bins to better visualize cell density
+ggplot(as.data.frame(spatialCoords(sfe))) +
+  geom_hex(aes(center_x, center_y), 
+           bins = 300) +
+  scale_fill_distiller(palette = "Blues", 
+                       direction = 1) +
+  scale_x_continuous(expand = expansion()) +
+  scale_y_continuous(expand = expansion()) +
+  theme_bw() + coord_equal()
+
+#Cell density is for the most part homogeneous 
+#but shows some structure with denser regions 
+#that seem to relate to the blood vessels
+
+#Quality control
+
+names(colData(sfe))
+
+#Plotting almost 600,000 polygons is kind of slow but doable
+system.time(
+  print(plotSpatialFeature(sfe, 
+                           "nCounts", 
+                           colGeometryName = "cellSeg"))
+)
+
+#Here nCounts kind of looks like salt and pepper. 
+#Using the scattermore package can speed up plotting a large number of points. 
+#In this non-interactive plot, the cell polygons are too small to see anyway, 
+#so plotting cell centroid points should be fine.
+
+#compare with and without scattermore 
+system.time({
+  print(plotSpatialFeature(sfe, "nCounts", colGeometryName = "centroids",
+                           scattermore = TRUE))
+})
+
+#segmentation
+#nCounts seems to be related to cell size; 
+#larger cells seem to have more total counts
+plot_colgeom_bbox <- function(sfe, feature, bbox,
+                              divergent = FALSE, 
+                              diverge_center = 0) {
+  df <- cellSeg(sfe)
+  if (feature %in% names(colData(sfe)))
+    df[[feature]] <- colData(sfe)[[feature]]
+  else
+    df[[feature]] <- as.vector(logcounts(sfe)[feature,])
+  feature <- make.names(feature)
+  names(df) <- make.names(names(df))
+  # Specify bounding box
+  bbox_use <- st_as_sfc(st_bbox(bbox))
+  # Subset the sf data frame with the bounding box
+  df <- df[bbox_use,]
+  if (divergent) {
+    r <- getDivergeRange(df[[feature]], 
+                         diverge_center)
+    # fill, since only for polygons for now
+    pal <- scico::scale_fill_scico(palette = "roma", 
+                                   begin = r[1], 
+                                   end = r[2])
+  } else
+    pal <- scale_fill_distiller(palette = "Blues", 
+                                direction = 1)
+  ggplot(df) + geom_sf(aes_string(fill = feature), 
+                       size = 0.1) +
+    pal + theme_bw() +
+    scale_x_continuous(expand = expansion()) +
+    scale_y_continuous(expand = expansion())
+}
+
+bbox_use <- c(xmin = 3000, xmax = 3500, ymin = 2500, ymax = 3000)
+
+plot_colgeom_bbox(sfe, "nCounts", bbox_use)
+
+#Since there aren’t too many genes, 
+#all genes and negative control probes can be displayed
+rownames(sfe)
+
+#The number of real genes is 498
+n_panel <- 498
+
+#distribution of nCounts, divided by the number of genes in the panel, 
+#so this distribution is more comparable 
+#across datasets with different numbers of genes
+colData(sfe)$nCounts_normed <- sfe$nCounts / n_panel
+colData(sfe)$nGenes_normed <- sfe$nGenes / n_panel
+
+#there are mysterious regular notches in the histogram 
+#of the number of genes detected
+plotColDataHistogram(sfe, 
+                     c("nCounts_normed", "nGenes_normed")) +
+  theme_bw()
+
+#plot the number of genes detected per cell, with geom_scattermore()
+plotSpatialFeature(sfe, 
+                   "nGenes", 
+                   colGeometryName = "centroids", 
+                   scattermore = TRUE)
+#Similarly to nCounts, the points look intermingled
+
+#Distribution of cell volume in space
+plotSpatialFeature(sfe, 
+                   "volume", 
+                   colGeometryName = "centroids", 
+                   scattermore = TRUE)
+
+#explore how nCounts relates to nGene
+plotColDataBin2D(sfe, 
+                 "nCounts", 
+                 "nGenes") + 
+  theme_bw()
+#There’s one branches in this plot
+
+#How does cell size relate to nCounts?
+plotColDataBin2D(sfe, 
+                 "volume", 
+                 "nCounts") + 
+  theme_bw()
+#branch has larger cells that tend to have more total counts
+
+#examine how cell size relates to number of genes detected
+plotColDataBin2D(sfe, 
+                 "volume", 
+                 "nGenes") + 
+  theme_bw()
+#There seem to be clusters that are possibly related to cell type
+
+#Negative controls
+
+is_blank <- str_detect(rownames(sfe), 
+                       "^Blank-")
+
+sfe <- addPerCellQCMetrics(sfe, 
+                           subset = list(blank = is_blank))
+
+names(colData(sfe))
+
+#Total transcript counts from the blank probes
+plotSpatialFeature(sfe, 
+                   "subsets_blank_sum", 
+                   colGeometryName = "centroids",
+                   scattermore = TRUE)
+
+#Number of blank features detected per cell
+plotSpatialFeature(sfe, 
+                   "subsets_blank_detected", 
+                   colGeometryName = "centroids",
+                   scattermore = TRUE)
+
+#Percentage of blank features per cell
+plotSpatialFeature(sfe, 
+                   "subsets_blank_percent", 
+                   colGeometryName = "centroids",
+                   scattermore = TRUE)
+#The percentage is more interesting: within the tissue, 
+#cells with high percentage of blank counts are scattered like salt and pepper
+#but more of these cells are on the all edges of the tissue and in 2 zones!!!, the edges of FOVs, 
+#where the tissue itself doesn’t end.
+
+#plot histograms
+plotColDataHistogram(sfe, 
+                     paste0("subsets_blank_", c("sum", "detected", "percent"))) +
+  theme_bw()
+
+#The NA’s are cells without any transcript detected
+mean(sfe$subsets_blank_sum > 0)
+#most cells have at least one blank count. 
+
+#By log transforming, the zeroes are removed from the plot
+plotColDataHistogram(sfe, 
+                     "subsets_blank_percent") +
+  scale_x_log10() +
+  annotation_logticks() +
+  theme_bw()
+#A small percentage of blank counts is acceptable. 
+#So we will remove the outlier based on the distribution of the percentage when it’s greater than zero. 
+
+#How does the blank percentage relate to total counts?
+plotColDataBin2D(sfe, 
+                 "nCounts", 
+                 "subsets_blank_percent") +
+  scale_fill_viridis_c() +
+  theme_bw()
+#The outliers in percentage of blank counts have low total counts. 
+#But some seemingly real cells with sizable nCounts also have not so low percentage of blank counts. Since the distribution of this percentage has a very long tail, 
+#we log transform it when finding outliers
+
+get_neg_ctrl_outliers <- function(col, sfe, nmads = 3, log = FALSE) {
+  inds <- colData(sfe)$nCounts > 0 & colData(sfe)[[col]] > 0
+  df <- colData(sfe)[inds,]
+  outlier_inds <- isOutlier(df[[col]], type = "higher", nmads = nmads, log = log)
+  outliers <- rownames(df)[outlier_inds]
+  col2 <- str_remove(col, "^subsets_")
+  col2 <- str_remove(col2, "_percent$")
+  new_colname <- paste("is", col2, "outlier", sep = "_")
+  colData(sfe)[[new_colname]] <- colnames(sfe) %in% outliers
+  sfe
+}
+
+sfe <- get_neg_ctrl_outliers("subsets_blank_percent", 
+                             sfe, 
+                             log = TRUE)
+
+#What proportion of all cells are outliers?
+mean(sfe$is_blank_outlier)
+
+#What’s the cutoff for outlier?
+min(sfe$subsets_blank_percent[sfe$is_blank_outlier])
+
+#Remove the outliers and empty cells
+(sfe <- sfe[, !sfe$is_blank_outlier & sfe$nCounts > 0])
+#555341 cells left (#568355 cells was in the dataset)
+
+
+#GENES
+
+# mean and variance of each gene
+rowData(sfe)$means <- rowMeans(counts(sfe))
+rowData(sfe)$vars <- rowVars(counts(sfe))
+
+#Most genes display higher mean expression than blanks, 
+#but there is considerable overlap in the distribution, 
+#probably because some genes expressed at lower levels 
+#or in fewer cells are included.
+rowData(sfe)$is_blank <- is_blank
+plotRowData(sfe, x = "means", y = "is_blank") +
+  scale_y_log10() +
+  annotation_logticks(sides = "b")
+
+#Here the “real” genes and negative controls 
+#are plotted in different colors
+plotRowData(sfe, x = "means", y = "vars", colour_by = "is_blank") +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() + scale_y_log10() +
+  annotation_logticks() +
+  coord_equal() +
+  theme_bw()
+#The red line y=x is expected 
+#when the data follows a Poisson distribution.
+
+#when zoomed in, the blanks are also somewhat overdispersed
+as.data.frame(rowData(sfe)[is_blank,]) |> 
+  ggplot(aes(means, vars)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() + scale_y_log10() +
+  annotation_logticks() +
+  coord_equal() +
+  theme_bw()
+
+#Spatial autocorrelation of QC metrics
+
+#plot that zoomed in patch to visually inspect cell-cell contiguity
+ggplot(cellSeg(sfe)[st_as_sfc(st_bbox(bbox_use)),]) + 
+  geom_sf()
+
+#There’re quite a few cells that are not contiguous to any other cell, 
+#and cell segmentation is imperfect, 
+#so purely using poly2nb() is problematic.
+
+#For now we use k nearest neighbors, with k=5, 
+#which seems like a reasonable approximation of contiguity 
+#based on the visual inspection
+
+#The spdep implementation of k nearest neighbors isn’t too bad
+system.time(
+  colGraph(sfe, "knn5") <- findSpatialNeighbors(sfe, method = "knearneigh", 
+                                                dist_type = "idw", k = 5, 
+                                                style = "W")
+)
+
+#Annoy is a faster way to find approximate k nearest neighbors, 
+#and is used in graph based clustering in scRNA-seq data. 
+#One way to use Annoy in R is to use AnnoyParam() in BiocNeighbors
+system.time({
+  foo <- findKNN(spatialCoords(sfe), k=5, BNPARAM=AnnoyParam())
+  # Split by row
+  foo_nb <- asplit(foo$index, 1)
+  dmat <- 1/foo$distance
+  # Row normalize the weights
+  dmat <- sweep(dmat, 1, rowSums(dmat), FUN = "/")
+  glist <- asplit(dmat, 1)
+  # Sort based on index
+  ord <- lapply(foo_nb, order)
+  foo_nb <- lapply(seq_along(foo_nb), function(i) foo_nb[[i]][ord[[i]]])
+  class(foo_nb) <- "nb"
+  glist <- lapply(seq_along(glist), function(i) glist[[i]][ord[[i]]])
+  
+  listw <- list(style = "W",
+                neighbours = foo_nb,
+                weights = glist)
+  class(listw) <- "listw"
+})
+#This took about half the time as spdep
+
+
+#A comparison of results
+#By and large the results are very similar, 
+#but there are some small differences 
+#as Annoy finds approximate k nearest neighbors.
+diff_nbs <- diffnb(colGraph(sfe, "knn5")$neighbours, 
+                   foo_nb)
+diff_card <- card(diff_nbs)
+summary(diff_card)
+
+#With the spatial neighborhood graph, 
+#we can compute Moran’s I for QC metrics
+
+#nCounts and nGenes have sizable positive Moran’s I’s
+sfe <- colDataMoransI(sfe, 
+                      c("nCounts", 
+                        "nGenes", 
+                        "volume"), 
+                      colGraphName = "knn5")
+
+colFeatureData(sfe)[c("nCounts", 
+                      "nGenes", 
+                      "volume"),]
+
+#check local Moran’s I, since in that little patch we examined above, 
+#some regions may have more positive spatial autocorrelation
+sfe <- colDataUnivariate(sfe, 
+                         type = "localmoran", 
+                         features = c("nCounts", 
+                                      "nGenes", 
+                                      "volume"),
+                         colGraphName = "knn5")
+
+plotLocalResult(sfe, 
+                "localmoran", 
+                c("nCounts", 
+                  "nGenes", 
+                  "volume"),
+                colGeometryName = "centroids", 
+                scattermore = TRUE,
+                ncol = 2, 
+                divergent = TRUE, 
+                diverge_center = 0) & 
+  theme_bw()
+
+#Moran’s I
+
+sfe <- logNormCounts(sfe)
+
+# not slow for almost 600,000 cells - only iOs(not Win)
+# system.time(
+#   sfe <- runMoransI(sfe, BPPARAM = MulticoreParam(2)))
+  
+#How are Moran’s I’s distributed for real genes and blank probes?
+plotRowData(sfe, 
+            x = "moran_sample01", 
+            y = "is_blank") +
+  geom_hline(yintercept = 0, 
+             linetype = 2)
+#The blanks are clustered tightly around 0
+#The vast majority of real genes have positive spatial autocorrelation, 
+#some quite strong.
+
+#Plot the top genes with positive spatial autocorrelation
+top_moran <- rownames(sfe)[order(rowData(sfe)$moran_sample01, 
+                                 decreasing = TRUE)[1:6]]
+plotSpatialFeature(sfe, 
+                   top_moran, 
+                   colGeometryName = "centroids", 
+                   scattermore = TRUE,
+                   ncol = 2)
+
+#Negative Moran’s I means 
+#that nearby cells tend to be more dissimilar to each other
+bottom_moran <- rownames(sfe)[order(rowData(sfe)$moran_sample01)[1]]
+
+bottom_abs_moran <- rownames(sfe)[order(abs(rowData(sfe)$moran_sample01))[1]]
+
+plot_colgeom_bbox(sfe, 
+                  bottom_moran, 
+                  bbox_use) +
+  plot_colgeom_bbox(sfe, 
+                    bottom_abs_moran, 
+                    bbox_use)
+#the feature with Moran’s I closest to 0 is a blank
+
+
+#Spatial autocorrelation at larger length scales
+
+#The k nearest neighbor graph 
+#used above only concerns 5 cells around each cell, 
+#which is a very small neighborhood, 
+#over a very small length scale
+
+#a binning to explore spatial autocorrelation 
+#at larger length scales can be computed 
+#to get a sense of the length scale of spatial autocorrelation
+(bins <- st_make_grid(colGeometry(sfe, "centroids"), 
+                      n = 100, 
+                      square = FALSE))
+
+#to bin the QC metrics by averaging the values from the cells
+# Since bins not completely covered by tissue have fewer cells, 
+#the mean may be less susceptible to edge effect than the sum, 
+#as bins near the edge will have lower sums, 
+#which may spuriously increase Moran’s I
+df <- cbind(colGeometry(sfe, "centroids"), 
+            colData(sfe)[,c("nCounts", 
+                            "nGenes", 
+                            "volume")])
+
+df_binned <- aggregate(df, 
+                       bins, 
+                       FUN = mean)
+
+# Remove bins not containing cells
+df_binned <- df_binned[!is.na(df_binned$nCounts),]
+
+#Plot the binned values
+# Not using facet_wrap to give each panel its own color scale
+plts <- lapply(c("nCounts", 
+                 "nGenes", 
+                 "volume"), function(f) {
+  ggplot(df_binned[,f]) + 
+                     geom_sf(aes_string(fill = f), 
+                             size = 0) +
+    scale_fill_distiller(palette = "Blues", 
+                         direction = 1)
+})
+
+wrap_plots(plts, nrow = 2)
+
+#compute Moran’s I over the binned data, 
+#with contiguity neighborhoods. 
+#zero.policy = TRUE because there are some bins with no neighbors
+nb <- poly2nb(df_binned)
+
+listw <- nb2listw(nb, 
+                  zero.policy = TRUE)
+
+calculateMoransI(t(as.matrix(st_drop_geometry(df_binned[,c("nCounts", 
+                                                           "nGenes", 
+                                                           "volume")]))),
+                 listw = listw, 
+                 zero.policy = TRUE)
+
+#Semivariogram
+
+# as_Spatial since automap uses old fashioned sp, the predecessor of sf
+#The numbers in this plot are the number of pairs in each distance bin
+#The variogram is not 0 at 0 distance (nugget)
+# The variogram levels off at greater distance but we do not see the sill 
+#(where is levels off) 
+#the range from visual inspection appears more than 4000 
+#while the model somehow indicates 2110
+
+v <- autofitVariogram(nCounts ~ 1, 
+                      as_Spatial(df_binned))
+
+plot(v)
+
+#how spatial autocorrelation may differ in different directions, 
+#i.e. anisotropy
+
+#Going before 2000  the variance drops 
+#at the northwest and southeast direction 
+#but not in other directions
+
+#(perhaps related to the repetitiveness 
+#of the hepatic lobules 
+#and the general central?? location of the blood vessels 
+#seen in the previous plots)
+v2 <- variogram(nCounts ~ 1, 
+                data = df_binned, 
+                width = 300, 
+                cutoff = 4500, 
+                map = TRUE)
+
+plot(v2)
+
+#The variogram can also be calculated at specified angles, 
+#here selected as sides of the hexagon
+
+v3 <- variogram(nCounts ~ 1, 
+                df_binned, 
+                alpha = c(30, 90, 150))
+
+v3_model <- fit.variogram(v3, 
+                          vgm("Ste"))
+
+plot(v3, 
+     v3_model)
+
+
+#PCA for larger datasets
+
+#The fastest methods are irlba::irlba()
+#That’s pretty quick for almost 600,000 cells
+set.seed(29)
+system.time(
+  sfe <- runPCA(sfe, 
+                ncomponents = 20, 
+                subset_row = !is_blank,
+                exprs_values = "logcounts",
+                scale = TRUE, 
+                BSPARAM = IrlbaParam())
+)
+
+gc()
+
+# the elbow plot to see variance explained by each PC
+ElbowPlot(sfe) + theme_bw()
+
+#Plot top gene loadings in each PC
+#Many of these genes seem to be related to the endothelium??
+plotDimLoadings(sfe) + theme_bw()
+
+#Plot the first 4 PCs in space
+spatialReducedDim(sfe, 
+                  "PCA", 4, 
+                  colGeometryName = "centroids", 
+                  scattermore = TRUE,
+                  divergent = TRUE, 
+                  diverge_center = 0)
+
+#makeshift function to plot a zoomed in patch
+#spatial structure in PC2 and PC3 at a smaller scale
+colData(sfe)$PC2 <- reducedDim(sfe, 
+                               "PCA", 
+                               withDimnames = FALSE)[,2]
+
+colData(sfe)$PC3 <- reducedDim(sfe, 
+                               "PCA", 
+                               withDimnames = FALSE)[,3]
+
+plot_colgeom_bbox(sfe, 
+                  "PC2", 
+                  bbox_use, 
+                  divergent = TRUE, 
+                  diverge_center = 0) + 
+  plot_colgeom_bbox(sfe, 
+                    "PC3", 
+                    bbox_use, 
+                    divergent = TRUE, 
+                    diverge_center = 0)
