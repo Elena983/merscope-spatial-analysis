@@ -18,6 +18,8 @@ Voyager: From geospatial to spatial omics.
 R package version 1.0.3, 
 https://github.com/pachterlab/voyager
 
+analis_sfe
+
 ![image](https://user-images.githubusercontent.com/68946912/214247285-c7cff14a-cfd6-4d49-a40f-909d121e0609.png)
 
 Percentage of blank features per cell
