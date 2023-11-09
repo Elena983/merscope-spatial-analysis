@@ -3,6 +3,11 @@
 Data from 
 https://console.cloud.google.com/storage/browser/vz-ffpe-showcase/HumanLiverCancerPatient1?pageState=(%22StorageObjectListTable%22:(%22f%22:%22%255B%255D%22))&prefix=&forceOnObjectsSortingFiltering=false
 
+Cell classification
+Analysis of Image-based Spatial Data in Seurat
+
+![iScreen Shoter - Google Chrome - 231109105350](https://github.com/Elena983/merscope-spatial-analysis/assets/68946912/641ae14c-2e67-4c6f-b26a-b0e216a34f9c)
+
 This code was create with Voyager package
 
 @Manual{,
